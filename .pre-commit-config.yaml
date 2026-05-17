@@ -1,0 +1,103 @@
+repos:
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.8.3 # Match the version pyproject.toml
+    hooks:
+      - id: commitizen
+      - id: commitizen-branch
+        stages: [pre-push]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.6 # Match the version pyproject.toml
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff
+        name: ruff-format
+        args: []
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0 # Match the version pyproject.toml
+    hooks:
+      - id: mypy
+        # Pre-commit invokes mypy file-by-file by default, which loses the
+        # project-level `[[tool.mypy.overrides]]` module-pattern carve-outs
+        # for tests and examples. Scope this hook to library source only;
+        # CI runs the full `uv run mypy src tests examples` invocation
+        # against the strict project config.
+        files: ^src/.*\.py$
+        additional_dependencies:
+          - "sqlalchemy[mypy] (>=2.0.40,<3.0.0)"
+          - "strawberry-graphql[debug-server,fastapi] (>=0.266.0,<0.267.0)"
+          - "typing-extensions (>=4.4)"
+
+  - repo: local
+    hooks:
+      - id: deptry
+        name: deptry
+        entry: uv run deptry .
+        language: system
+        always_run: true
+        pass_filenames: false
+
+      - id: no-emoji
+        name: no-emoji
+        description: Forbid emoji characters in project-authored files.
+        entry: python3 scripts/check-no-emoji.py
+        language: system
+        # Scope to project-authored paths; exclude vendored tooling, the
+        # virtualenv, and the lockfile. The markdown-lint exclusion for
+        # working drafts does NOT extend to emoji content -- the no-emoji
+        # rule applies to every project-authored file.
+        exclude: |
+          (?x)^(
+              \.specify/scripts/.* |
+              \.agents/.*          |
+              \.venv/.*            |
+              \.git/.*             |
+              uv\.lock
+          )$
+
+      - id: pep695-generics
+        name: pep695-generics
+        description: Forbid legacy TypeVar / ParamSpec / Generic[T] / TypeAlias forms.
+        entry: python3 scripts/check-pep695.py
+        language: system
+        # Scope to project-authored Python source under src/ and tests/.
+        # The checker also accepts Python files outside this scope (e.g.
+        # examples/, scripts/) and will flag any violation there too; we
+        # constrain via `files` so pre-commit only feeds it candidates.
+        files: ^(src/|tests/|examples/|scripts/).*\.py$
+        exclude: ^scripts/check-pep695\.py$
+
+      - id: no-print
+        name: no print() or logging.basicConfig() in src/ or tests/
+        description: AST-based check; only real call sites fire (comments, docstrings, and string literals are not false-positives).
+        entry: python3 scripts/check-no-print.py
+        language: system
+        files: ^(src/|tests/).*\.py$
+
+      - id: no-type-ignore
+        name: "no `# type: ignore` / `# pyright: ignore` in library code"
+        description: Tokenize-based check (only real source comments fire). Scoped to library source; tests and examples may suppress narrow lines where the type system cannot be convinced.
+        entry: python3 scripts/check-no-type-ignore.py
+        language: system
+        files: ^src/.*\.py$
+
+      - id: tests-use-assertpy
+        name: tests must use assertpy
+        description: Every test file under tests/ MUST import assertpy. Bare `assert` is forbidden in test bodies except when annotated `# narrow:`.
+        entry: python3 scripts/check-test-assertpy.py
+        language: system
+        files: ^tests/.*\.py$
+        # Skip package markers, conftests, shared fixture helpers, and
+        # the typing-only fixtures (which intentionally have no test
+        # bodies -- they exist for mypy to typecheck).
+        exclude: |
+          (?x)^tests/(
+              .*/__init__\.py |
+              __init__\.py |
+              .*conftest\.py |
+              conftest\.py |
+              .*_fixtures\.py |
+              typing/fixtures/.*
+          )$
