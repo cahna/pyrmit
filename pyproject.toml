@@ -1,0 +1,81 @@
+[project]
+name = "pyrmit"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Conor Heine", email = "conor.heine@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "assertpy>=1.1",
+    "commitizen>=4.16.2",
+    "coverage>=7.14.0",
+    "deptry>=0.25.1",
+    "mypy>=2.1.0",
+    "pre-commit>=4.6.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "pytest-json-ctrf>=0.5.0",
+    "ruff>=0.15.13",
+    "types-assertpy>=1.1.0.20260508",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = ["stubs/*"]
+preview = true
+
+[tool.ruff.lint]
+select = ["B", "C", "D", "E", "F", "I", "N", "W", "FBT001", "FBT002", "FBT003"]
+ignore = [
+    "D100", # Missing docstring in public module
+    "D104", # Missing docstring in public package
+    "D107", # Missing docstring in __init__
+    "D203", # 1 blank line required before class
+    "D212", # Multi-line docstring summary should start at the first line
+]
+
+[tool.ruff.lint.pylint]
+max-positional-args = 2
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D", # Ignore all docstring warnings in tests
+    "FBT", # Boolean arguments are common in test fixtures and protocols
+]
+
+[tool.coverage.report]
+skip_empty = true
+
+[tool.coverage.run]
+branch = true
+omit = ["tests/*"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy","returns.contrib.mypy.returns_plugin"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/stubs"
+warn_return_any = true
+warn_unused_configs = true
+no_implicit_reexport = true
+check_untyped_defs = true
+exclude = ["dist", "build", "stubs", ".venv"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_scheme = "pep440"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
