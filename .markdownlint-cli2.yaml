@@ -1,0 +1,8 @@
+globs:
+  - "**/*.md"
+ignores:
+  - "specs/**"
+  - "docs/specs/**"
+  - "docs/superpowers/**"
+  - "docs/frontend-*.md"
+gitignore: "**/.gitignore"
