@@ -1,6 +1,6 @@
 [project]
 name = "pyrmit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Typed, fail-closed authorization engine for Python 3.12+ with optional Strawberry, FastAPI, and SQLAlchemy adapters."
 readme = "README.md"
 authors = [
