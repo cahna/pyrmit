@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Final
 from weakref import WeakKeyDictionary
 
 from graphql.language.ast import OperationType
@@ -36,6 +36,28 @@ from pyrmit.core.lazy import Lazy
 # principal to another user's request.
 _principal_cache: WeakKeyDictionary[object, Any] = WeakKeyDictionary()
 
+type DenyHandler = Callable[[Decision, DenialSurface], Exception]
+"""Host hook mapping a deny ``Decision`` + ``DenialSurface`` to an exception.
+
+Called for the ``FORBIDDEN`` and ``NOT_FOUND`` surfaces (``NULL`` never
+raises). Lets a host application substitute its own exception taxonomy
+(e.g. one carrying ``extensions.code`` for GraphQL clients) for pyrmit's
+built-in :class:`PermissionDenied` / :class:`ResourceNotFound`.
+"""
+
+_SUBJECT_NOT_FOUND: Final[Decision] = Decision(allowed=False, reason="subject_not_found")
+
+
+def default_deny_handler(decision: Decision, surface: DenialSurface) -> Exception:
+    """Default mapping: ``PermissionDenied`` for FORBIDDEN, ``ResourceNotFound`` for NOT_FOUND.
+
+    Preserves pyrmit's historical behavior for hosts that don't supply
+    their own ``deny_handler``.
+    """
+    if surface is DenialSurface.NOT_FOUND:
+        return ResourceNotFound(decision.reason or "not_found")
+    return PermissionDenied(decision.reason or "forbidden")
+
 
 class _PolicyGuard(FieldExtension):
     """Internal FieldExtension implementing the policy_guard semantics."""
@@ -51,6 +73,7 @@ class _PolicyGuard(FieldExtension):
         load_subject_from_source: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None,
         load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None,
         metadata: Mapping[str, str],
+        deny_handler: DenyHandler,
         read_only: bool = True,
     ) -> None:
         """Construct the extension. Loader arity is validated by ``policy_guard``."""
@@ -62,6 +85,7 @@ class _PolicyGuard(FieldExtension):
         self._load_subject_from_source = load_subject_from_source
         self._load_subject_after = load_subject_after
         self._metadata = metadata
+        self._deny_handler = deny_handler
         self._read_only = read_only
 
     async def _resolve_engine(self, info: Info[Any, Any]) -> PolicyEngine[Any, Any, Any]:
@@ -113,15 +137,17 @@ class _PolicyGuard(FieldExtension):
         # at decide() time; default to FORBIDDEN for the missing-policy case.
         return DenialSurface.FORBIDDEN
 
-    @staticmethod
-    def _apply_denial(decision: Decision, surface: DenialSurface) -> Any:
-        """Translate a deny decision into the configured framework signal."""
-        if surface is DenialSurface.FORBIDDEN:
-            raise PermissionDenied(decision.reason or "forbidden")
-        if surface is DenialSurface.NOT_FOUND:
-            raise ResourceNotFound(decision.reason or "not_found")
-        # DenialSurface.NULL
-        return None
+    def _apply_denial(self, decision: Decision, surface: DenialSurface) -> Any:
+        """Translate a deny decision into the configured framework signal.
+
+        ``NULL`` returns ``None`` (field-level redaction); ``FORBIDDEN`` and
+        ``NOT_FOUND`` raise whatever ``self._deny_handler`` returns, letting
+        the host substitute its own exception taxonomy for pyrmit's
+        built-in :class:`PermissionDenied` / :class:`ResourceNotFound`.
+        """
+        if surface is DenialSurface.NULL:
+            return None
+        raise self._deny_handler(decision, surface)
 
     def _check_post_resolution_safe(self, info: Info[Any, Any]) -> None:
         """Refuse to run a post-resolution guard against a mutation operation.
@@ -169,7 +195,10 @@ class _PolicyGuard(FieldExtension):
             if subject is None:
                 # The resolved value yields no subject to decide against:
                 # treat as "no resource" per the contract.
-                raise ResourceNotFound("subject_post_resolution_missing")
+                raise self._deny_handler(
+                    Decision(allowed=False, reason="subject_post_resolution_missing"),
+                    DenialSurface.NOT_FOUND,
+                )
             decision = await engine.adecide(
                 principal=principal,
                 action=self._action,
@@ -191,7 +220,7 @@ class _PolicyGuard(FieldExtension):
             # Missing subject is NOT a guarded denial -- it's an absence,
             # and absence always surfaces as NOT_FOUND regardless of the
             # binding's denial surface.
-            raise ResourceNotFound("subject_not_found")
+            raise self._deny_handler(_SUBJECT_NOT_FOUND, DenialSurface.NOT_FOUND)
 
         decision = await engine.adecide(
             principal=principal,
@@ -214,6 +243,7 @@ def policy_guard(
     load_subject_from_source: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None = None,
     load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None = None,
     metadata: Mapping[str, str] = MappingProxyType({}),
+    deny_handler: DenyHandler | None = None,
 ) -> FieldExtension:
     """Construct a Strawberry FieldExtension that guards a field with a policy.
 
@@ -250,6 +280,11 @@ def policy_guard(
             ordering.
         metadata: Optional adapter-supplied audit metadata. Values MUST
             be strings.
+        deny_handler: Optional hook mapping a deny ``Decision`` +
+            ``DenialSurface`` to the exception to raise for FORBIDDEN and
+            NOT_FOUND denials (``NULL`` always returns ``None``). Defaults
+            to :func:`default_deny_handler`, which raises pyrmit's
+            built-in :class:`PermissionDenied` / :class:`ResourceNotFound`.
 
     Returns:
         A :class:`FieldExtension` ready to attach via
@@ -281,6 +316,7 @@ def policy_guard(
         load_subject_from_source=load_subject_from_source,
         load_subject_after=load_subject_after,
         metadata=metadata,
+        deny_handler=deny_handler if deny_handler is not None else default_deny_handler,
         # Pre-resolution paths are always safe -- the policy decides
         # before any resolver-side-effect can fire. The legacy
         # ``load_subject_after`` path is post-resolution, so it shares
@@ -297,6 +333,7 @@ def post_resolution_policy_guard(
     subject_type: type[Any],
     load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]],
     metadata: Mapping[str, str] = MappingProxyType({}),
+    deny_handler: DenyHandler | None = None,
     read_only: bool = True,
 ) -> FieldExtension:
     """Strawberry field guard for post-resolution redaction.
@@ -329,6 +366,9 @@ def post_resolution_policy_guard(
             (or ``None`` to surface NOT_FOUND).
         metadata: Optional adapter-supplied audit metadata. Values MUST
             be strings.
+        deny_handler: Optional hook mapping a deny ``Decision`` +
+            ``DenialSurface`` to the exception to raise for FORBIDDEN and
+            NOT_FOUND denials. See :func:`policy_guard`.
         read_only: When ``True`` (default), refuses to run inside a
             mutation operation. Set to ``False`` to opt out -- only do
             this if the resolver has no observable side effect.
@@ -346,5 +386,6 @@ def post_resolution_policy_guard(
         load_subject_from_source=None,
         load_subject_after=load_subject_after,
         metadata=metadata,
+        deny_handler=deny_handler if deny_handler is not None else default_deny_handler,
         read_only=read_only,
     )
