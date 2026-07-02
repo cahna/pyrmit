@@ -501,7 +501,10 @@ class PolicyEngine[PrincipalT, ActionT, SubjectT]:
         policy body exception -> ``policy_error``. A policy exception is also
         logged at WARNING (with ``exc_info=True``) on the ``pyrmit.core.engine``
         logger -- a raising policy body is treated as noteworthy by default,
-        not something that requires opting into DEBUG to observe.
+        not something that requires opting into DEBUG to observe. Because
+        ``exc_info=True`` carries the exception's own message into the log
+        record, policy bodies should avoid interpolating user-supplied or
+        otherwise sensitive data into the exception messages they raise.
 
         Args:
             principal: The caller's principal value.

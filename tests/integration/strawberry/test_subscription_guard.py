@@ -23,6 +23,7 @@ from strawberry.types import ExecutionResult
 
 from pyrmit import ALLOW, Decision, DenialSurface, Entitlements, PolicyEngine, Principal, deny
 from pyrmit.adapters.strawberry import PolicyGuardFactory
+from pyrmit.adapters.strawberry.exceptions import PermissionDenied
 
 
 class Action(StrEnum):
@@ -98,7 +99,11 @@ def _pre_resolution_schema(factory: PolicyGuardFactory[Principal[str], Action, D
     return strawberry.Schema(query=Query, subscription=Subscription)
 
 
-def _post_resolution_schema(factory: PolicyGuardFactory[Principal[str], Action, Doc]) -> strawberry.Schema:
+def _post_resolution_schema(
+    factory: PolicyGuardFactory[Principal[str], Action, Doc],
+    *,
+    read_only: bool = True,
+) -> strawberry.Schema:
     @strawberry.type
     class Query:
         @strawberry.field
@@ -113,8 +118,50 @@ def _post_resolution_schema(factory: PolicyGuardFactory[Principal[str], Action, 
                     action=Action.READ,
                     subject_type=Doc,
                     load_subject_after=_load_doc_after,
+                    read_only=read_only,
                 )
             ]
+        )
+        async def ticks(self, doc_id: int) -> AsyncGenerator[int, None]:
+            del doc_id
+            for i in range(3):
+                yield i
+
+    return strawberry.Schema(query=Query, subscription=Subscription)
+
+
+def _null_engine() -> PolicyEngine[Principal[str], Action, Doc]:
+    """Engine whose READ binding registers a NULL denial surface."""
+    engine: PolicyEngine[Principal[str], Action, Doc] = PolicyEngine()
+
+    @engine.policy(action=Action.READ, subject_type=Doc, denial_surface=DenialSurface.NULL)
+    def _read(_principal: Principal[str], doc: Doc) -> Decision:
+        return ALLOW if doc.public else deny("doc_private")
+
+    return engine
+
+
+def _null_factory(*, deny_handler: Any = None) -> PolicyGuardFactory[Principal[str], Action, Doc]:
+    return PolicyGuardFactory(
+        engine=_null_engine(),
+        principal_loader=lambda _info: Principal(actor="u1", entitlements=Entitlements.empty()),
+        deny_handler=deny_handler,
+    )
+
+
+def _null_subscription_schema(factory: PolicyGuardFactory[Principal[str], Action, Doc]) -> strawberry.Schema:
+    """Pre-resolution guard on a subscription, backed by a NULL-surface binding."""
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def ok(self) -> bool:
+            return True
+
+    @strawberry.type
+    class Subscription:
+        @strawberry.subscription(
+            extensions=[factory.guard(action=Action.READ, subject_type=Doc, load_subject=_load_doc)]
         )
         async def ticks(self, doc_id: int) -> AsyncGenerator[int, None]:
             del doc_id
@@ -160,7 +207,11 @@ class TestPreResolutionSubscription:
         results = asyncio.run(_collect(schema, "subscription { ticks(docId: 999) }"))
         errors = [e for r in results for e in (r.errors or [])]
         assert_that(errors).is_not_empty()
-        assert_that(str(errors[0].message)).contains("subject_not_found")
+        # The DEFAULT deny_handler normalizes NOT_FOUND to the constant
+        # "not_found" so a missing subject is indistinguishable from a
+        # NOT_FOUND-surfaced denial (existence concealment). The internal
+        # "subject_not_found" reason MUST NOT leak to the client.
+        assert_that(str(errors[0].message)).is_equal_to("not_found")
         ticks = [r.data["ticks"] for r in results if r.data]
         assert_that(ticks).is_empty()
 
@@ -185,3 +236,48 @@ class TestPostResolutionSubscriptionBlocked:
         assert_that(str(errors[0].message)).contains("post_resolution_guard_on_subscription_blocked")
         ticks = [r.data["ticks"] for r in results if r.data]
         assert_that(ticks).is_empty()
+
+    def test_read_only_false_does_not_opt_out_of_subscription_block(self) -> None:
+        # read_only=False is a coherent opt-out for MUTATIONS, but on a
+        # subscription a post-resolution guard can NEVER work (the resolver
+        # returns a stream, not a value). The refusal must be unconditional:
+        # a clean PermissionDenied, not a raw TypeError from awaiting the
+        # async generator.
+        schema = _post_resolution_schema(_factory(), read_only=False)
+        results = asyncio.run(_collect(schema, "subscription { ticks(docId: 1) }"))
+        errors = [e for r in results for e in (r.errors or [])]
+        assert_that(errors).is_not_empty()
+        message = str(errors[0].message)
+        assert_that(message).contains("post_resolution_guard_on_subscription_blocked")
+        assert_that(message).does_not_contain("TypeError")
+        originals = [e.original_error for r in results for e in (r.errors or [])]
+        assert_that(originals[0]).is_instance_of(PermissionDenied)
+        ticks = [r.data["ticks"] for r in results if r.data]
+        assert_that(ticks).is_empty()
+
+
+class TestNullSurfaceSubscriptionDeny:
+    def test_null_surface_deny_falls_closed_to_forbidden(self) -> None:
+        # A binding registered NULL (for field redaction) also guards a
+        # subscription. NULL has no meaning for a stream -- returning None
+        # would make graphql-core raise "Subscription field must return
+        # AsyncIterable. Received: None". The guard must fall closed to
+        # FORBIDDEN and the custom deny_handler must observe that surface.
+        schema = _null_subscription_schema(_null_factory(deny_handler=_host_deny_handler))
+        results = asyncio.run(_collect(schema, "subscription { ticks(docId: 2) }"))
+        originals = [e.original_error for r in results for e in (r.errors or [])]
+        assert_that(originals).is_not_empty()
+        assert_that(originals[0]).is_instance_of(HostDenied)
+        assert isinstance(originals[0], HostDenied)  # narrow: attribute access
+        assert_that(originals[0].surface).is_equal_to(DenialSurface.FORBIDDEN.value)
+        assert_that(originals[0].reason).is_equal_to("doc_private")
+        ticks = [r.data["ticks"] for r in results if r.data]
+        assert_that(ticks).is_empty()
+
+    def test_null_surface_allow_still_streams(self) -> None:
+        # Sanity: the NULL-surfaced binding still opens the stream on ALLOW.
+        schema = _null_subscription_schema(_null_factory())
+        results = asyncio.run(_collect(schema, "subscription { ticks(docId: 1) }"))
+        values = [r.data["ticks"] for r in results if r.data is not None]
+        assert_that(values).is_equal_to([0, 1, 2])
+        assert_that([r for r in results if r.errors]).is_empty()

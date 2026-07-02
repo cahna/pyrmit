@@ -30,18 +30,18 @@ from pyrmit.core.errors import ConfigurationError
 from pyrmit.core.lazy import Lazy
 
 # Per-request principal cache. Keyed by the request's ``info.context``
-# identity, then by the guard's ``principal_loader`` identity: ``ctx ->
-# {id(principal_loader): principal}``. The inner key ensures two guards
-# built from factories with DIFFERENT principal loaders on the same
-# request never share a cached principal -- without it, the second
-# guard would silently observe the first loader's principal. Loader
-# lifetimes are module/factory scope, so ``id()`` reuse is not a
-# concern within a live request. Values are garbage-collected with the
-# context (typically when the request completes); using a
-# ``WeakKeyDictionary`` means a singleton or shared context will defeat
-# caching but cannot leak one user's principal to another user's
-# request.
-_principal_cache: WeakKeyDictionary[object, dict[int, Any]] = WeakKeyDictionary()
+# identity, then by the guard's ``principal_loader`` object itself:
+# ``ctx -> {principal_loader: principal}``. The inner key ensures two
+# guards built from factories with DIFFERENT principal loaders on the
+# same request never share a cached principal -- without it, the second
+# guard would silently observe the first loader's principal. Using the
+# callable itself (callables are hashable) rather than ``id()`` avoids
+# any id-reuse hazard from a loader being collected and its address
+# reassigned. Values are garbage-collected with the context (typically
+# when the request completes); using a ``WeakKeyDictionary`` means a
+# singleton or shared context will defeat caching but cannot leak one
+# user's principal to another user's request.
+_principal_cache: WeakKeyDictionary[object, dict[Callable[..., Any], Any]] = WeakKeyDictionary()
 _MISSING: Final[object] = object()
 
 type DenyHandler = Callable[[Decision, DenialSurface], Exception]
@@ -51,6 +51,21 @@ Called for the ``FORBIDDEN`` and ``NOT_FOUND`` surfaces (``NULL`` never
 raises). Lets a host application substitute its own exception taxonomy
 (e.g. one carrying ``extensions.code`` for GraphQL clients) for pyrmit's
 built-in :class:`PermissionDenied` / :class:`ResourceNotFound`.
+
+A custom handler receiving ``DenialSurface.NOT_FOUND`` MUST produce
+output indistinguishable from its missing-resource output: a
+NOT_FOUND-surfaced DENIAL (a real resource the caller may not see) and a
+genuine ABSENCE (no such resource) both arrive here, and if the handler
+lets their differing ``decision.reason`` leak into the client-visible
+error it reintroduces the existence side channel that NOT_FOUND exists
+to close. The handler still receives the real ``Decision`` (with its
+audit-grade reason) so it can log or branch internally -- just not emit
+distinguishable output.
+
+Construction-safety refusals (the mutation / subscription post-resolution
+blocks) do NOT route through this handler: they raise pyrmit's own
+:class:`PermissionDenied` directly, because they are configuration errors
+detected before any policy decision exists to hand off.
 """
 
 _SUBJECT_NOT_FOUND: Final[Decision] = Decision(allowed=False, reason="subject_not_found")
@@ -59,11 +74,20 @@ _SUBJECT_NOT_FOUND: Final[Decision] = Decision(allowed=False, reason="subject_no
 def default_deny_handler(decision: Decision, surface: DenialSurface) -> Exception:
     """Default mapping: ``PermissionDenied`` for FORBIDDEN, ``ResourceNotFound`` for NOT_FOUND.
 
-    Preserves pyrmit's historical behavior for hosts that don't supply
-    their own ``deny_handler``.
+    For NOT_FOUND the outward message is the CONSTANT ``"not_found"``,
+    independent of ``decision.reason``. This is deliberate: a
+    NOT_FOUND-surfaced DENIAL (e.g. reason ``"doc_private"``) and a
+    genuine ABSENCE (reason ``"subject_not_found"`` /
+    ``"subject_post_resolution_missing"``) MUST be indistinguishable to
+    the client, or the differing messages let a caller tell
+    restricted-from-missing -- the existence side channel this surface
+    exists to close. The real ``decision.reason`` is preserved on the
+    ``Decision`` for audit and is still handed to any CUSTOM
+    ``deny_handler``; only this default handler's client-visible message
+    is normalized.
     """
     if surface is DenialSurface.NOT_FOUND:
-        return ResourceNotFound(decision.reason or "not_found")
+        return ResourceNotFound("not_found")
     return PermissionDenied(decision.reason or "forbidden")
 
 
@@ -109,14 +133,14 @@ class _PolicyGuard(FieldExtension):
 
         Uses a module-level ``WeakKeyDictionary`` so the outer cache
         lifetime is bound to the context object (typically per-request);
-        the inner mapping is additionally keyed by ``id(principal_loader)``
-        so two guards on the same request with different loaders never
-        share a cached principal. Contexts that don't support weak
-        references fall through to the no-cache path -- correct but
-        slower.
+        the inner mapping is additionally keyed by the ``principal_loader``
+        callable itself so two guards on the same request with different
+        loaders never share a cached principal. Contexts that don't
+        support weak references fall through to the no-cache path --
+        correct but slower.
         """
         ctx = info.context
-        loader_key = id(self._principal_loader)
+        loader_key = self._principal_loader
         try:
             per_ctx = _principal_cache.get(ctx)
         except TypeError:
@@ -172,36 +196,54 @@ class _PolicyGuard(FieldExtension):
             return None
         raise self._deny_handler(decision, surface)
 
+    @staticmethod
+    def _is_subscription(info: Info[Any, Any]) -> bool:
+        """Return whether the current operation is a subscription.
+
+        Defensive against ``info.operation`` being absent (some test or
+        adapter contexts synthesize a bare ``Info``); treats an
+        unavailable operation as "not a subscription".
+        """
+        try:
+            return info.operation.operation is OperationType.SUBSCRIPTION
+        except AttributeError:
+            return False
+
     def _check_post_resolution_safe(self, info: Info[Any, Any]) -> None:
         """Refuse to run a post-resolution guard against a mutation or subscription.
 
         The post-resolution path runs the resolver BEFORE consulting the
-        policy. For mutation operations that means a side effect (DB write,
-        payment, external call) executes before authorization is checked. For
-        subscription operations the resolver produces the stream before any
-        decision could be reached, so the policy cannot gate access to it.
-        ``read_only=True`` (the default for ``post_resolution_policy_guard``)
-        refuses these combinations at request time; ``read_only=False``
-        opts in explicitly.
+        policy. Two operation kinds are refused, on different grounds:
+
+        * **Subscriptions are refused UNCONDITIONALLY** (independent of
+          ``read_only``). A subscription resolver returns a *stream*
+          (async generator), not a value -- there is nothing for
+          ``load_subject_after`` to inspect and the guard could never
+          reach a decision, so ``read_only=False`` is not a coherent
+          opt-out. Attach a pre-resolution guard instead.
+        * **Mutations are refused only when ``read_only=True``** (the
+          default). Here the resolver's side effect (DB write, payment,
+          external call) would fire before authorization; ``read_only=
+          False`` is a coherent opt-in when the caller accepts that
+          ordering.
         """
-        if not self._read_only:
-            return
         try:
             op_type = info.operation.operation
         except AttributeError:
             return
-        if op_type is OperationType.MUTATION:
+        if op_type is OperationType.SUBSCRIPTION:
+            raise PermissionDenied(
+                "post_resolution_guard_on_subscription_blocked: a post-resolution "
+                "guard cannot run on a subscription operation -- the resolver "
+                "returns a stream, so there is no resolved value for "
+                "load_subject_after to authorize; attach a pre-resolution guard "
+                "instead"
+            )
+        if self._read_only and op_type is OperationType.MUTATION:
             raise PermissionDenied(
                 "post_resolution_guard_on_mutation_blocked: this guard runs the "
                 "resolver before authorization; pass read_only=False to accept "
                 "that the mutation's side effect will fire before the decision"
-            )
-        if op_type is OperationType.SUBSCRIPTION:
-            raise PermissionDenied(
-                "post_resolution_guard_on_subscription_blocked: this guard runs the "
-                "resolver before authorization, but a subscription resolver produces "
-                "the stream before any decision can be reached; attach a pre-resolution "
-                "guard instead, or pass read_only=False to opt out"
             )
 
     async def resolve_async(
@@ -269,6 +311,14 @@ class _PolicyGuard(FieldExtension):
             # the stream/value back untouched -- awaiting an async generator
             # would raise TypeError before the stream ever starts.
             return result
+        if surface is DenialSurface.NULL and self._is_subscription(info):
+            # NULL means "redact the field value" -- but a subscription
+            # resolver produces a *stream*, and there is no single value to
+            # null out. Returning None here would make graphql-core raise
+            # "Subscription field must return AsyncIterable. Received: None",
+            # presenting a fail-closed deny as a server bug. Redaction
+            # semantics don't exist for streams, so fall closed to FORBIDDEN.
+            raise self._deny_handler(decision, DenialSurface.FORBIDDEN)
         return self._apply_denial(decision, surface)
 
 
@@ -332,7 +382,11 @@ def policy_guard(
             field attachment -- the binding's own registered surface
             (and any other guard built against the same binding) is
             unaffected. Defaults to ``None``, which preserves the
-            binding's own surface.
+            binding's own surface. Note: on a **subscription** operation
+            a ``NULL`` surface has no meaning -- there is no single field
+            value to redact in a stream -- so a NULL-surfaced deny on a
+            subscription falls closed to ``FORBIDDEN`` (raising through
+            ``deny_handler``) rather than returning ``None``.
 
     Returns:
         A :class:`FieldExtension` ready to attach via
@@ -394,11 +448,18 @@ def post_resolution_policy_guard(
         appropriate for **read-only redaction** (the resolver returns a
         candidate value, the guard decides whether the caller may see it),
         and inappropriate for fields with side effects (mutations,
-        external calls, payments). The default ``read_only=True`` blocks
-        attachment to mutation operations at request time, raising
+        external calls, payments). The default ``read_only=True`` refuses
+        to run inside a mutation operation at request time, raising
         :class:`PermissionDenied` BEFORE the resolver runs. Pass
         ``read_only=False`` only if you explicitly accept that the
         resolver's side effects will fire before the decision is reached.
+
+        Subscription operations are refused UNCONDITIONALLY -- regardless
+        of ``read_only`` -- because a post-resolution guard can never work
+        on a subscription: the resolver returns a stream, so there is no
+        resolved value for ``load_subject_after`` to authorize. Attach a
+        pre-resolution guard (``policy_guard(..., load_subject=...)``)
+        instead; ``read_only=False`` is not an opt-out here.
 
     Behaviorally equivalent to ``policy_guard(..., load_subject_after=fn)``
     with the additional ``read_only`` safety check. Use this when the
@@ -424,7 +485,9 @@ def post_resolution_policy_guard(
             this if the resolver has no observable side effect.
         denial_surface: Optional per-guard override of the binding's
             registered :class:`DenialSurface`. Applies only to THIS
-            field attachment. See :func:`policy_guard`.
+            field attachment. See :func:`policy_guard` -- including the
+            note that a ``NULL`` surface falls closed to ``FORBIDDEN`` on
+            subscription operations.
 
     Returns:
         A :class:`FieldExtension` ready to attach via

@@ -87,7 +87,10 @@ to make sure the README never drifts from real behavior.
   ALLOW decisions are actually covered). A crashing policy is also
   logged at WARNING (with `exc_info=True`) on the `pyrmit.core.engine`
   logger, since `engine.decide`/`engine.adecide` treat it as noteworthy
-  even though the caller sees a normal deny `Decision`.
+  even though the caller sees a normal deny `Decision`. Because
+  `exc_info=True` carries the raised exception's own message into the log
+  record, policy bodies should avoid interpolating user-supplied or
+  sensitive data into the exception messages they raise.
 - **Defensively immutable** — `Decision.detail` and `AuditEntry.metadata`
   are wrapped in `MappingProxyType` at construction and reject non-primitive
   values at runtime.
@@ -105,13 +108,18 @@ Adapters live under `pyrmit.adapters.*` and are optional extras:
   `post_resolution_policy_guard(...)` is the explicit, safer counterpart
   for redaction-style use; it refuses to run inside a mutation operation
   by default (`read_only=True`) because the resolver runs before the
-  authorization decision, and the same guard blocks attachment to
-  `@strawberry.subscription` fields for the same reason — a subscription
-  resolver produces the stream before any decision can be reached, so a
-  post-resolution guard can't gate it. Pre-resolution guards (the
-  `load_subject` / `load_subject_from_source` phases of `policy_guard`)
-  work on subscriptions: the decision is made before the stream starts,
-  so a deny raises (or nulls) instead of ever opening the subscription.
+  authorization decision, and it refuses to run on subscription
+  operations *unconditionally* (regardless of `read_only`) — a
+  subscription resolver produces a stream, so there is no resolved value
+  for a post-resolution guard to authorize; attach a pre-resolution guard
+  instead. Pre-resolution guards (the `load_subject` /
+  `load_subject_from_source` phases of `policy_guard`) work on
+  subscriptions: the decision is made before the stream starts, so a deny
+  terminates the subscription with an error instead of ever opening it. A
+  `NULL` denial surface has no meaning for a stream (there is no single
+  field value to redact), so a NULL-surfaced deny on a subscription falls
+  closed to `FORBIDDEN` (it raises through `deny_handler`) rather than
+  returning `None`.
   `PolicyGuardFactory(engine=..., principal_loader=...)` is the
   recommended entry point for real schemas — it captures the engine and
   principal loader once and exposes `.guard(...)` / `.post_resolution_guard(...)`
@@ -142,7 +150,16 @@ Adapters live under `pyrmit.adapters.*` and are optional extras:
     all accept an optional `denial_surface: DenialSurface` override.
     It applies only to that one field attachment — the binding's own
     registered surface, and any other guard built against the same
-    binding, is unaffected.
+    binding, is unaffected. The override governs how a *denial* surfaces;
+    it does not touch absence: a guard whose surface is (or is overridden
+    to) `NULL` still raises `NOT_FOUND` when the subject loader returns
+    `None`, because a missing subject is an absence, not a redactable
+    value. With the default `deny_handler`, that NOT_FOUND carries the
+    constant message `not_found` — identical to a NOT_FOUND-surfaced
+    denial — so restricted and missing resources stay indistinguishable;
+    a custom `deny_handler` receiving `DenialSurface.NOT_FOUND` MUST
+    preserve that indistinguishability or it reopens the existence side
+    channel.
   - The per-request principal cache is keyed by `(info.context,
     principal_loader)` identity, not just by context: two guards on the
     same request built from factories with *different* principal
