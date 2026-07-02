@@ -23,6 +23,7 @@ from strawberry.extensions.field_extension import FieldExtension
 from strawberry.types import Info
 
 from pyrmit.adapters.strawberry.guard import DenyHandler, policy_guard, post_resolution_policy_guard
+from pyrmit.core.decision import DenialSurface
 from pyrmit.core.engine import PolicyEngine
 from pyrmit.core.lazy import Lazy
 
@@ -70,6 +71,7 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
         load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[ST | None]] | None = None,
         metadata: Mapping[str, str] = MappingProxyType({}),
         deny_handler: DenyHandler | None = None,
+        denial_surface: DenialSurface | None = None,
     ) -> FieldExtension:
         """Build a pre-/from-source/post-resolution guard sharing this factory's deps.
 
@@ -97,6 +99,11 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
             metadata: Optional adapter-supplied audit metadata.
             deny_handler: Per-call override of the factory's
                 ``deny_handler``; defaults to the factory's own value.
+            denial_surface: Optional per-call override of the binding's
+                registered :class:`DenialSurface`, applying only to this
+                one guard attachment. There is no factory-level default
+                for this -- it is per-call only. See
+                :func:`~pyrmit.adapters.strawberry.guard.policy_guard`.
         """
         return policy_guard(
             engine=self.engine,
@@ -108,6 +115,7 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
             load_subject_after=load_subject_after,
             metadata=metadata,
             deny_handler=deny_handler if deny_handler is not None else self.deny_handler,
+            denial_surface=denial_surface,
         )
 
     def post_resolution_guard[ST](
@@ -119,6 +127,7 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
         metadata: Mapping[str, str] = MappingProxyType({}),
         deny_handler: DenyHandler | None = None,
         read_only: bool = True,
+        denial_surface: DenialSurface | None = None,
     ) -> FieldExtension:
         """Build a post-resolution redaction guard sharing this factory's deps.
 
@@ -136,6 +145,11 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
                 ``deny_handler``; defaults to the factory's own value.
             read_only: When ``True`` (default), refuses to run inside a
                 mutation operation.
+            denial_surface: Optional per-call override of the binding's
+                registered :class:`DenialSurface`, applying only to this
+                one guard attachment. Per-call only; no factory-level
+                default. See
+                :func:`~pyrmit.adapters.strawberry.guard.post_resolution_policy_guard`.
         """
         return post_resolution_policy_guard(
             engine=self.engine,
@@ -146,4 +160,5 @@ class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
             metadata=metadata,
             deny_handler=deny_handler if deny_handler is not None else self.deny_handler,
             read_only=read_only,
+            denial_surface=denial_surface,
         )

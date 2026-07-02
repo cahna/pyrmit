@@ -498,7 +498,10 @@ class PolicyEngine[PrincipalT, ActionT, SubjectT]:
         """Synchronously evaluate a policy.
 
         Pure; never raises; runs no I/O. Missing binding -> ``policy_not_registered``;
-        policy body exception -> ``policy_error``.
+        policy body exception -> ``policy_error``. A policy exception is also
+        logged at WARNING (with ``exc_info=True``) on the ``pyrmit.core.engine``
+        logger -- a raising policy body is treated as noteworthy by default,
+        not something that requires opting into DEBUG to observe.
 
         Args:
             principal: The caller's principal value.
@@ -514,7 +517,7 @@ class PolicyEngine[PrincipalT, ActionT, SubjectT]:
         try:
             return binding.policy(principal, subject)
         except Exception:
-            _LOGGER.debug(
+            _LOGGER.warning(
                 "policy raised; converting to deny reason=policy_error action=%r subject_type=%r",
                 action,
                 type(subject).__name__,

@@ -83,6 +83,7 @@ class _PolicyGuard(FieldExtension):
         metadata: Mapping[str, str],
         deny_handler: DenyHandler,
         read_only: bool = True,
+        surface_override: DenialSurface | None = None,
     ) -> None:
         """Construct the extension. Loader arity is validated by ``policy_guard``."""
         self._engine = engine
@@ -95,6 +96,7 @@ class _PolicyGuard(FieldExtension):
         self._metadata = metadata
         self._deny_handler = deny_handler
         self._read_only = read_only
+        self._surface_override = surface_override
 
     async def _resolve_engine(self, info: Info[Any, Any]) -> PolicyEngine[Any, Any, Any]:
         """Return the engine, awaiting the ``Lazy`` resolver if one was supplied."""
@@ -135,7 +137,15 @@ class _PolicyGuard(FieldExtension):
         return principal
 
     def _binding_denial_surface(self, engine: PolicyEngine[Any, Any, Any]) -> DenialSurface:
-        """Look up the configured denial surface for this binding (O(1))."""
+        """Return this guard's denial surface: the per-guard override if set, else the binding's.
+
+        ``surface_override`` (set via ``policy_guard(..., denial_surface=...)``
+        or ``post_resolution_policy_guard(..., denial_surface=...)``) applies
+        only to THIS guard attachment; the binding's own registered surface
+        is untouched and other guards on the same binding are unaffected.
+        """
+        if self._surface_override is not None:
+            return self._surface_override
         binding = engine.binding_for(
             action=self._action,
             subject_type=self._subject_type,
@@ -273,6 +283,7 @@ def policy_guard(
     load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None = None,
     metadata: Mapping[str, str] = MappingProxyType({}),
     deny_handler: DenyHandler | None = None,
+    denial_surface: DenialSurface | None = None,
 ) -> FieldExtension:
     """Construct a Strawberry FieldExtension that guards a field with a policy.
 
@@ -316,6 +327,12 @@ def policy_guard(
             NOT_FOUND denials (``NULL`` always returns ``None``). Defaults
             to :func:`default_deny_handler`, which raises pyrmit's
             built-in :class:`PermissionDenied` / :class:`ResourceNotFound`.
+        denial_surface: Optional per-guard override of the binding's
+            registered :class:`DenialSurface`. Applies only to THIS
+            field attachment -- the binding's own registered surface
+            (and any other guard built against the same binding) is
+            unaffected. Defaults to ``None``, which preserves the
+            binding's own surface.
 
     Returns:
         A :class:`FieldExtension` ready to attach via
@@ -353,6 +370,7 @@ def policy_guard(
         # ``load_subject_after`` path is post-resolution, so it shares
         # the default mutation block with ``post_resolution_policy_guard``.
         read_only=load_subject_after is not None,
+        surface_override=denial_surface,
     )
 
 
@@ -366,6 +384,7 @@ def post_resolution_policy_guard(
     metadata: Mapping[str, str] = MappingProxyType({}),
     deny_handler: DenyHandler | None = None,
     read_only: bool = True,
+    denial_surface: DenialSurface | None = None,
 ) -> FieldExtension:
     """Strawberry field guard for post-resolution redaction.
 
@@ -403,6 +422,9 @@ def post_resolution_policy_guard(
         read_only: When ``True`` (default), refuses to run inside a
             mutation operation. Set to ``False`` to opt out -- only do
             this if the resolver has no observable side effect.
+        denial_surface: Optional per-guard override of the binding's
+            registered :class:`DenialSurface`. Applies only to THIS
+            field attachment. See :func:`policy_guard`.
 
     Returns:
         A :class:`FieldExtension` ready to attach via
@@ -419,4 +441,5 @@ def post_resolution_policy_guard(
         metadata=metadata,
         deny_handler=deny_handler if deny_handler is not None else default_deny_handler,
         read_only=read_only,
+        surface_override=denial_surface,
     )
