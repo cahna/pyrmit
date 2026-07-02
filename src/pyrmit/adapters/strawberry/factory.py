@@ -28,8 +28,17 @@ from pyrmit.core.lazy import Lazy
 
 
 @dataclass(frozen=True)
-class PolicyGuardFactory:
+class PolicyGuardFactory[PrincipalT, ActionT, SubjectT]:
     """Bundles an engine + principal loader for repeated guard construction.
+
+    Generic over the same ``(PrincipalT, ActionT, SubjectT)`` triple as
+    :class:`~pyrmit.core.engine.PolicyEngine`. The type parameters are
+    inferred from the ``engine`` (and ``principal_loader``) arguments, so
+    callers rarely spell them out; a factory built from a
+    ``PolicyEngine[Principal[Actor, str], Action, Article]`` propagates
+    those types onto every ``.guard(...)`` call, letting mypy reject a
+    wrong ``action`` enum or a subject loader whose element type does not
+    match ``subject_type``.
 
     Attributes:
         engine: The policy engine to consult on every guarded field.
@@ -47,18 +56,18 @@ class PolicyGuardFactory:
             :func:`pyrmit.adapters.strawberry.guard.default_deny_handler`.
     """
 
-    engine: PolicyEngine[Any, Any, Any] | Lazy[PolicyEngine[Any, Any, Any]]
-    principal_loader: Callable[[Info[Any, Any]], Any | Awaitable[Any]]
+    engine: PolicyEngine[PrincipalT, ActionT, SubjectT] | Lazy[PolicyEngine[PrincipalT, ActionT, SubjectT]]
+    principal_loader: Callable[[Info[Any, Any]], PrincipalT | Awaitable[PrincipalT]]
     deny_handler: DenyHandler | None = None
 
-    def guard(
+    def guard[ST](
         self,
         *,
-        action: Any,
-        subject_type: type[Any],
-        load_subject: Callable[[Info[Any, Any], Mapping[str, Any]], Awaitable[Any | None]] | None = None,
-        load_subject_from_source: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None = None,
-        load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]] | None = None,
+        action: ActionT,
+        subject_type: type[ST],
+        load_subject: Callable[[Info[Any, Any], Mapping[str, Any]], Awaitable[ST | None]] | None = None,
+        load_subject_from_source: Callable[[Any, Info[Any, Any]], Awaitable[ST | None]] | None = None,
+        load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[ST | None]] | None = None,
         metadata: Mapping[str, str] = MappingProxyType({}),
         deny_handler: DenyHandler | None = None,
     ) -> FieldExtension:
@@ -66,6 +75,16 @@ class PolicyGuardFactory:
 
         Forwards to :func:`policy_guard` -- see its docstring for the
         loader semantics and the exactly-one-loader invariant.
+
+        Generic in an **unbounded** ``ST`` matching the engine's
+        ``policy()`` shape (see
+        :meth:`pyrmit.core.engine.PolicyEngine.policy` for why the bound
+        ``ST: SubjectT`` cannot be expressed): an engine parameterized
+        over a union or marker-base ``SubjectT`` can still build guards
+        against a concrete subtype. ``ST`` is pinned by ``subject_type``,
+        so a loader whose element type does not match is rejected by
+        mypy, while ``action`` is checked against the factory's
+        ``ActionT``.
 
         Args:
             action: The action enum value the binding governs.
@@ -91,12 +110,12 @@ class PolicyGuardFactory:
             deny_handler=deny_handler if deny_handler is not None else self.deny_handler,
         )
 
-    def post_resolution_guard(
+    def post_resolution_guard[ST](
         self,
         *,
-        action: Any,
-        subject_type: type[Any],
-        load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[Any | None]],
+        action: ActionT,
+        subject_type: type[ST],
+        load_subject_after: Callable[[Any, Info[Any, Any]], Awaitable[ST | None]],
         metadata: Mapping[str, str] = MappingProxyType({}),
         deny_handler: DenyHandler | None = None,
         read_only: bool = True,
@@ -104,7 +123,9 @@ class PolicyGuardFactory:
         """Build a post-resolution redaction guard sharing this factory's deps.
 
         Forwards to :func:`post_resolution_policy_guard` -- see its
-        docstring for the ``read_only`` mutation-safety check.
+        docstring for the ``read_only`` mutation-safety check. Generic in
+        the same unbounded ``ST`` as :meth:`guard`; ``ST`` is pinned by
+        ``subject_type`` and ``action`` is checked against ``ActionT``.
 
         Args:
             action: The action enum value the binding governs.

@@ -69,6 +69,42 @@ class TestPolicyGuardFactory:
             return
         assert_that(False).described_as("expected frozen instance").is_true()
 
+    def test_explicitly_parameterized_factory_builds_working_guard(self) -> None:
+        """A factory spelled with explicit type parameters composes at
+        runtime (frozen dataclass + PEP 695 generics) and produces a guard
+        behaviorally identical to the inferred form."""
+        engine = _engine_with_owner_rule()
+        factory: PolicyGuardFactory[Principal[Actor, str], Action, Article] = PolicyGuardFactory(
+            engine=engine,
+            principal_loader=principal_from_ctx,
+        )
+
+        @strawberry.type
+        class Query:
+            @strawberry.field(
+                extensions=[
+                    factory.guard(
+                        action=Action.READ,
+                        subject_type=Article,
+                        load_subject=load_article,
+                    )
+                ],
+            )
+            async def article(self, article_id: strawberry.ID) -> str:
+                del article_id
+                return "ok"
+
+        schema = strawberry.Schema(query=Query)
+        ctx = make_ctx(Actor(user_id=uuid4(), is_admin=True))
+        result = asyncio.run(
+            schema.execute(
+                f'{{ article(articleId: "{PUBLISHED_ID}") }}',
+                context_value=ctx,
+            )
+        )
+        assert_that(result.errors).is_none()
+        assert_that(result.data).is_equal_to({"article": "ok"})
+
     def test_guard_delegates_to_policy_guard_for_pre_resolution_allow(self) -> None:
         engine = _engine_with_owner_rule()
         factory = PolicyGuardFactory(engine=engine, principal_loader=principal_from_ctx)
