@@ -84,7 +84,10 @@ to make sure the README never drifts from real behavior.
   policy raising any exception denies (`policy_error`); audit-store
   failure denies (`audit_unavailable`) when `audit_failure_mode="deny"`
   (which requires `audit_allows=True` at engine construction so that
-  ALLOW decisions are actually covered).
+  ALLOW decisions are actually covered). A crashing policy is also
+  logged at WARNING (with `exc_info=True`) on the `pyrmit.core.engine`
+  logger, since `engine.decide`/`engine.adecide` treat it as noteworthy
+  even though the caller sees a normal deny `Decision`.
 - **Defensively immutable** — `Decision.detail` and `AuditEntry.metadata`
   are wrapped in `MappingProxyType` at construction and reject non-primitive
   values at runtime.
@@ -102,12 +105,49 @@ Adapters live under `pyrmit.adapters.*` and are optional extras:
   `post_resolution_policy_guard(...)` is the explicit, safer counterpart
   for redaction-style use; it refuses to run inside a mutation operation
   by default (`read_only=True`) because the resolver runs before the
-  authorization decision.
+  authorization decision, and the same guard blocks attachment to
+  `@strawberry.subscription` fields for the same reason — a subscription
+  resolver produces the stream before any decision can be reached, so a
+  post-resolution guard can't gate it. Pre-resolution guards (the
+  `load_subject` / `load_subject_from_source` phases of `policy_guard`)
+  work on subscriptions: the decision is made before the stream starts,
+  so a deny raises (or nulls) instead of ever opening the subscription.
   `PolicyGuardFactory(engine=..., principal_loader=...)` is the
   recommended entry point for real schemas — it captures the engine and
   principal loader once and exposes `.guard(...)` / `.post_resolution_guard(...)`
-  so individual fields don't restate the cross-cutting deps. See
-  `examples/strawberry_graphql/example_di.py` for a DI-style wiring.
+  so individual fields don't restate the cross-cutting deps. The factory
+  is generic — `PolicyGuardFactory[PrincipalT, ActionT, SubjectT]` — and
+  its type parameters are normally inferred from the `engine` and
+  `principal_loader` arguments, so a factory built from a
+  `PolicyEngine[Principal[Actor], Action, Article]` propagates those
+  types onto every `.guard(...)` call: mypy rejects a wrong `action`
+  enum value or a subject loader whose element type doesn't match
+  `subject_type`. See `examples/strawberry_graphql/example_di.py` for a
+  DI-style wiring.
+  - **`deny_handler`**: `policy_guard`, `post_resolution_policy_guard`,
+    and `PolicyGuardFactory` all accept an optional `deny_handler:
+    (Decision, DenialSurface) -> Exception` hook, called for FORBIDDEN
+    and NOT_FOUND denials (NULL never raises, so it's never called for
+    that surface). Use it to raise a host application's own exception
+    taxonomy — e.g. one carrying a structured error code for GraphQL
+    clients — instead of pyrmit's built-in `PermissionDenied` /
+    `ResourceNotFound`, which are plain `Exception` subclasses and do
+    **not** carry an `extensions.code`. The default,
+    `default_deny_handler`, preserves that historical behavior. On the
+    factory, `deny_handler` is set once and applied to every guard it
+    builds, with a per-call override on `.guard(...)` /
+    `.post_resolution_guard(...)`.
+  - **`denial_surface`**: `guard()`, `post_resolution_guard()`, and the
+    bare `policy_guard()` / `post_resolution_policy_guard()` functions
+    all accept an optional `denial_surface: DenialSurface` override.
+    It applies only to that one field attachment — the binding's own
+    registered surface, and any other guard built against the same
+    binding, is unaffected.
+  - The per-request principal cache is keyed by `(info.context,
+    principal_loader)` identity, not just by context: two guards on the
+    same request built from factories with *different* principal
+    loaders never share a cached principal, even though they share the
+    same context object.
 - **FastAPI**: `require_policy(...)` — dependency factory that translates
   denials to HTTP responses; the NULL surface requires a `null_mapper`.
 - **SQLAlchemy**: `visibility_scope(...)` decorator marks a function as
