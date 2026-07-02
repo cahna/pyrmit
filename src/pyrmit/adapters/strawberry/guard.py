@@ -30,11 +30,19 @@ from pyrmit.core.errors import ConfigurationError
 from pyrmit.core.lazy import Lazy
 
 # Per-request principal cache. Keyed by the request's ``info.context``
-# identity; values are garbage-collected with the context (typically when
-# the request completes). Using a ``WeakKeyDictionary`` means a singleton
-# or shared context will defeat caching but cannot leak one user's
-# principal to another user's request.
-_principal_cache: WeakKeyDictionary[object, Any] = WeakKeyDictionary()
+# identity, then by the guard's ``principal_loader`` identity: ``ctx ->
+# {id(principal_loader): principal}``. The inner key ensures two guards
+# built from factories with DIFFERENT principal loaders on the same
+# request never share a cached principal -- without it, the second
+# guard would silently observe the first loader's principal. Loader
+# lifetimes are module/factory scope, so ``id()`` reuse is not a
+# concern within a live request. Values are garbage-collected with the
+# context (typically when the request completes); using a
+# ``WeakKeyDictionary`` means a singleton or shared context will defeat
+# caching but cannot leak one user's principal to another user's
+# request.
+_principal_cache: WeakKeyDictionary[object, dict[int, Any]] = WeakKeyDictionary()
+_MISSING: Final[object] = object()
 
 type DenyHandler = Callable[[Decision, DenialSurface], Exception]
 """Host hook mapping a deny ``Decision`` + ``DenialSurface`` to an exception.
@@ -95,26 +103,31 @@ class _PolicyGuard(FieldExtension):
         return self._engine
 
     async def _resolve_principal(self, info: Info[Any, Any]) -> Any:
-        """Return the per-request principal, caching it keyed by ``info.context``.
+        """Return the per-request principal, cached per ``(context, principal_loader)``.
 
-        Uses a module-level ``WeakKeyDictionary`` so the cache lifetime
-        is bound to the context object (typically per-request). Contexts
-        that don't support weak references fall through to the no-cache
-        path -- correct but slower.
+        Uses a module-level ``WeakKeyDictionary`` so the outer cache
+        lifetime is bound to the context object (typically per-request);
+        the inner mapping is additionally keyed by ``id(principal_loader)``
+        so two guards on the same request with different loaders never
+        share a cached principal. Contexts that don't support weak
+        references fall through to the no-cache path -- correct but
+        slower.
         """
         ctx = info.context
+        loader_key = id(self._principal_loader)
         try:
-            cached = _principal_cache.get(ctx)
+            per_ctx = _principal_cache.get(ctx)
         except TypeError:
             # Some context types reject ``__hash__`` or ``__eq__`` against
             # WeakKeyDictionary; fall through to fresh resolution.
-            cached = None
-        if cached is not None:
+            per_ctx = None
+        cached = per_ctx.get(loader_key, _MISSING) if per_ctx is not None else _MISSING
+        if cached is not _MISSING:
             return cached
         result = self._principal_loader(info)
         principal = await result if inspect.isawaitable(result) else result
         try:
-            _principal_cache[ctx] = principal
+            _principal_cache.setdefault(ctx, {})[loader_key] = principal
         except TypeError:
             # Context isn't weak-refable (e.g. a plain ``dict``);
             # caching is an optimization, not a correctness requirement.
@@ -264,8 +277,10 @@ def policy_guard(
             principal. Receives the Strawberry ``Info`` and returns
             either a concrete principal or an awaitable of one; the
             adapter normalizes both forms. Result is cached per
-            ``info.context`` identity so multiple guarded fields on a
-            single request share a single resolution.
+            ``(info.context, principal_loader)`` identity, so multiple
+            guarded fields on a single request that share the same
+            loader share a single resolution, while guards built with
+            different loaders never observe each other's principal.
         action: The action enum value the binding governs.
         subject_type: The concrete subject class the binding governs.
         load_subject: Optional pre-resolution loader from kwargs.
