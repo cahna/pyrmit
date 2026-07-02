@@ -163,13 +163,15 @@ class _PolicyGuard(FieldExtension):
         raise self._deny_handler(decision, surface)
 
     def _check_post_resolution_safe(self, info: Info[Any, Any]) -> None:
-        """Refuse to run a post-resolution guard against a mutation operation.
+        """Refuse to run a post-resolution guard against a mutation or subscription.
 
         The post-resolution path runs the resolver BEFORE consulting the
         policy. For mutation operations that means a side effect (DB write,
-        payment, external call) executes before authorization is checked.
+        payment, external call) executes before authorization is checked. For
+        subscription operations the resolver produces the stream before any
+        decision could be reached, so the policy cannot gate access to it.
         ``read_only=True`` (the default for ``post_resolution_policy_guard``)
-        refuses this combination at request time; ``read_only=False``
+        refuses these combinations at request time; ``read_only=False``
         opts in explicitly.
         """
         if not self._read_only:
@@ -183,6 +185,13 @@ class _PolicyGuard(FieldExtension):
                 "post_resolution_guard_on_mutation_blocked: this guard runs the "
                 "resolver before authorization; pass read_only=False to accept "
                 "that the mutation's side effect will fire before the decision"
+            )
+        if op_type is OperationType.SUBSCRIPTION:
+            raise PermissionDenied(
+                "post_resolution_guard_on_subscription_blocked: this guard runs the "
+                "resolver before authorization, but a subscription resolver produces "
+                "the stream before any decision can be reached; attach a pre-resolution "
+                "guard instead, or pass read_only=False to opt out"
             )
 
     async def resolve_async(
@@ -242,7 +251,14 @@ class _PolicyGuard(FieldExtension):
             metadata=metadata,
         )
         if decision.allowed:
-            return await next_(source, info, **kwargs)
+            result = next_(source, info, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            # Async-generator (subscription) or plain value from a sync
+            # resolver: the ALLOW decision was already made above, so hand
+            # the stream/value back untouched -- awaiting an async generator
+            # would raise TypeError before the stream ever starts.
+            return result
         return self._apply_denial(decision, surface)
 
 
