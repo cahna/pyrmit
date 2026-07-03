@@ -17,9 +17,11 @@ class TestNoSplitGateAPI:
         # Allowlist the documented public surface.
         documented = {
             "ConfigurationError",
+            "DenyHandler",
             "PermissionDenied",
             "PolicyGuardFactory",
             "ResourceNotFound",
+            "default_deny_handler",
             "policy_guard",
             "post_resolution_policy_guard",
             # Re-exported submodules (importable but not in __all__).

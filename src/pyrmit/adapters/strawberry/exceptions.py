@@ -1,24 +1,32 @@
 """Typed exceptions raised by the Strawberry adapter.
 
-These exceptions propagate as Strawberry-recognized errors and serialize
-with stable extension ``code`` values that clients can match on.
+These are the *default* exceptions ``policy_guard`` raises for FORBIDDEN
+and NOT_FOUND denials. They serialize as plain GraphQL errors -- Strawberry
+does not attach an ``extensions.code`` to them automatically. Hosts that
+want a stable machine-readable error code (or their own exception
+taxonomy entirely) should supply a ``deny_handler`` to ``policy_guard`` /
+``post_resolution_policy_guard`` / ``PolicyGuardFactory``, which is
+invoked in place of raising these directly.
 """
 
 from __future__ import annotations
 
 
 class PermissionDenied(Exception):  # noqa: N818  -- matches GraphQL ecosystem naming
-    """Raised by ``policy_guard`` for FORBIDDEN denial.
+    """Default exception raised by ``policy_guard`` for FORBIDDEN denial.
 
-    GraphQL response: error with ``extensions.code = "FORBIDDEN"``.
+    Serializes as a plain GraphQL error message. Supply a ``deny_handler``
+    to raise a different exception (e.g. one carrying a structured error
+    code) instead.
     """
 
 
 class ResourceNotFound(Exception):  # noqa: N818
-    """Raised by ``policy_guard`` for NOT_FOUND denial.
+    """Default exception raised by ``policy_guard`` for NOT_FOUND denial.
 
-    GraphQL response: error with ``extensions.code = "NOT_FOUND"``. The
-    error shape is identical to "subject loader returned None" so the
-    response cannot distinguish missing-vs-restricted -- this concealment
-    is intentional and prevents existence-disclosure side channels.
+    Serializes as a plain GraphQL error message, identical in shape to
+    "subject loader returned None" -- the response cannot distinguish
+    missing-vs-restricted -- this concealment is intentional and prevents
+    existence-disclosure side channels. Supply a ``deny_handler`` to raise
+    a different exception instead.
     """

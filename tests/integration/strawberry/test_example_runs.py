@@ -43,7 +43,12 @@ class TestStrawberryExampleRuns:
         assert_that(result.stdout).contains("'title': 'Draft post'")
         assert_that(result.stdout).contains("[owner]")
         assert_that(result.stdout).contains("[stranger]")
-        assert_that(result.stdout).contains("article_unpublished")
+        # The default deny_handler normalizes NOT_FOUND to the constant
+        # "not_found": the stranger sees a missing-resource error and the
+        # internal "article_unpublished" reason MUST NOT leak (it would let
+        # the client distinguish restricted-from-missing).
+        assert_that(result.stdout).contains("not_found")
+        assert_that(result.stdout).does_not_contain("article_unpublished")
 
     def test_example_redacts_email_via_null_surface(self) -> None:
         result = subprocess.run(

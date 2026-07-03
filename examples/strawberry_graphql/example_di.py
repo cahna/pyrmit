@@ -148,7 +148,11 @@ async def load_article(info: Info[Any, Any], kwargs: Mapping[str, Any]) -> Artic
 
 
 def _engine_from_ctx(info: Info[Any, Any]) -> PolicyEngine[Principal[Actor, str], Action, Article]:
-    return info.context.authz_engine  # type: ignore[no-any-return]
+    # ``info.context`` is Strawberry-Any; assign it to a typed intermediate
+    # so the return is concretely typed (``RequestContext.authz_engine`` is
+    # already annotated) rather than leaking Any out of the accessor.
+    context: RequestContext = info.context
+    return context.authz_engine
 
 
 def _principal_from_ctx(info: Info[Any, Any]) -> Principal[Actor, str]:
@@ -157,8 +161,11 @@ def _principal_from_ctx(info: Info[Any, Any]) -> Principal[Actor, str]:
 
 
 # Bundle the cross-cutting deps once; every guarded field calls
-# ``policy.guard(...)`` without restating engine or principal loader.
-policy = PolicyGuardFactory(
+# ``policy.guard(...)`` without restating engine or principal loader. The
+# factory is parameterized over the same (principal, action, subject)
+# triple as the engine, so ``policy.guard(action=..., subject_type=...)``
+# is type-checked against ``Action`` / ``Article``.
+policy: PolicyGuardFactory[Principal[Actor, str], Action, Article] = PolicyGuardFactory(
     engine=Lazy(_engine_from_ctx),
     principal_loader=_principal_from_ctx,
 )
