@@ -172,6 +172,12 @@ Adapters live under `pyrmit.adapters.*` and are optional extras:
   `verify_scope_applied(...)` is a tripwire test helper that checks the
   predicate is genuinely present on a compiled query.
 
+## FAQ
+
+Design rationale — including why the Strawberry adapter is a field
+*extension* rather than a `BasePermission` class, and how the two compose
+during a migration — lives in [docs/faq.md](docs/faq.md).
+
 ## Development
 
 ```bash
